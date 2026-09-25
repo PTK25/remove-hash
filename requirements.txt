@@ -1,0 +1,7 @@
+# Nenhuma dependência pip em tempo de execução — só a biblioteca padrão do Python 3.9+.
+# Dependência externa: FFmpeg (ffmpeg + ffprobe) para vídeo e áudio.
+#   macOS:   brew install ffmpeg python-tk   (ou use ./install.sh)
+#   Linux:   sudo apt install ffmpeg python3-tk
+#
+# Opcional, só para rodar os testes de imagem (tests/test_core.py):
+# pillow
