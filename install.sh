@@ -56,7 +56,7 @@ if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
   SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 if [ -z "$SRC_DIR" ] || [ ! -f "$SRC_DIR/remove_hash_core.py" ]; then
-  info "Baixando a versão mais recente de github.com/$REPO…"
+  info "Baixando a versão mais recente de github.com/${REPO}…"
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf "$TMP_DIR"' EXIT
   curl -fsSL "https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz" | tar -xz -C "$TMP_DIR" \
