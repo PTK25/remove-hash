@@ -13,6 +13,7 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -61,6 +62,194 @@ def open_in_finder(path: str, reveal: bool = False) -> None:
         pass
 
 
+def fmt_time(sec: float) -> str:
+    m, s = divmod(max(0.0, sec), 60)
+    return f"{int(m)}:{s:04.1f}"
+
+
+def parse_time(text: str) -> float:
+    """Aceita "75", "75.5", "1:15" ou "1:15.5" (vírgula também vale como decimal)."""
+    parts = text.strip().replace(",", ".").split(":")
+    if not 1 <= len(parts) <= 3 or any(p.strip() == "" for p in parts):
+        raise ValueError(text)
+    total = 0.0
+    for p in parts:
+        total = total * 60 + float(p)
+    if total < 0:
+        raise ValueError(text)
+    return total
+
+
+# ─────────────────────────────────────────────────────────
+# CORTE RÁPIDO
+# ─────────────────────────────────────────────────────────
+
+class TrimDialog:
+    """Escolhe início/fim de um vídeo, com prévia do quadro em cada ponto."""
+
+    PREVIEW_W = 360
+
+    def __init__(self, app: "App", path: str, duration: float):
+        self.app, self.path, self.duration = app, path, duration
+        start, end = app.trims.get(path, (0.0, 0.0))
+        self.start = tk.DoubleVar(value=start)
+        self.end = tk.DoubleVar(value=end or duration)
+        self._after: dict[str, str] = {}
+        self._photos: dict[str, tk.PhotoImage] = {}
+        self._tmp: list[str] = []
+        self._seq = {"start": 0, "end": 0}          # descarta prévias que chegam fora de ordem
+        self._ready: queue.Queue = queue.Queue()     # (chave, seq, png) vindos das threads do ffmpeg
+        pw, ph = self.PREVIEW_W, self.PREVIEW_W * 9 // 16
+        self._blank = tk.PhotoImage(width=pw, height=ph)  # fixa o tamanho em pixels antes da 1ª prévia
+
+        win = self.win = tk.Toplevel(app.root)
+        win.title(f"Cortar — {os.path.basename(path)}")
+        win.configure(bg=P["bg"])
+        win.transient(app.root)
+        win.resizable(False, False)
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=f"Duração: {fmt_time(duration)}  ·  arraste ou digite (ex.: 1:15.5)",
+                  style="Dim.TLabel").pack(anchor="w")
+
+        cols = ttk.Frame(frame)
+        cols.pack(fill="x", pady=(12, 0))
+        self.widgets = {}
+        for col, (key, label, var) in enumerate((("start", "Início", self.start), ("end", "Fim", self.end))):
+            box = ttk.Frame(cols)
+            box.grid(row=0, column=col, padx=(0 if col == 0 else 16, 0), sticky="n")
+            ttk.Label(box, text=label).pack(anchor="w")
+            preview = tk.Label(box, bg=P["card"], image=self._blank, text="carregando…", fg=P["dim"],
+                               compound="center", bd=0, width=pw, height=ph)
+            preview.pack(pady=(6, 6))
+            scale = ttk.Scale(box, from_=0, to=duration, variable=var, orient="horizontal",
+                              length=self.PREVIEW_W, command=lambda _v, k=key: self._on_scale(k))
+            scale.pack()
+            entry = ttk.Entry(box, width=10, justify="center")
+            entry.pack(pady=(6, 0))
+            entry.bind("<Return>", lambda _e, k=key: self._on_entry(k))
+            entry.bind("<FocusOut>", lambda _e, k=key: self._on_entry(k))
+            self.widgets[key] = (preview, entry)
+            self._sync_entry(key)
+            self._schedule_preview(key, 0)
+
+        self.lbl_len = ttk.Label(frame, style="Dim.TLabel")
+        self.lbl_len.pack(anchor="w", pady=(12, 0))
+        self._update_len()
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(12, 0))
+        ttk.Button(row, text="Aplicar", style="Accent.TButton", command=self._apply).pack(side="right")
+        ttk.Button(row, text="Cancelar", command=self._close).pack(side="right", padx=(0, 8))
+        ttk.Button(row, text="Remover corte", command=self._clear).pack(side="left")
+        win.bind("<Escape>", lambda e: self._close())
+        win.protocol("WM_DELETE_WINDOW", self._close)
+        win.grab_set()
+        self._poll()
+
+    def _var(self, key: str) -> tk.DoubleVar:
+        return self.start if key == "start" else self.end
+
+    def _sync_entry(self, key: str):
+        entry = self.widgets[key][1]
+        entry.delete(0, "end")
+        entry.insert(0, fmt_time(self._var(key).get()))
+
+    def _update_len(self):
+        length = self.end.get() - self.start.get()
+        self.lbl_len.configure(text=f"Trecho final: {fmt_time(max(0.0, length))}",
+                               style="Dim.TLabel" if length > 0 else "Err.TLabel")
+
+    def _on_scale(self, key: str):
+        self._sync_entry(key)
+        self._update_len()
+        self._schedule_preview(key)
+
+    def _on_entry(self, key: str):
+        try:
+            value = min(self.duration, parse_time(self.widgets[key][1].get()))
+        except ValueError:
+            value = self._var(key).get()
+        self._var(key).set(value)
+        self._on_scale(key)
+
+    def _schedule_preview(self, key: str, delay: int = 250):
+        if key in self._after:
+            self.win.after_cancel(self._after[key])
+        self._after[key] = self.win.after(delay, lambda: self._render_preview(key))
+
+    def _render_preview(self, key: str):
+        self._after.pop(key, None)
+        # último quadro: recua um pouco para o ffmpeg ainda achar imagem
+        t = min(self._var(key).get(), max(0.0, self.duration - 0.1))
+        ffmpeg = core.find_ffmpeg()
+        if not ffmpeg:
+            return
+        fd, png = tempfile.mkstemp(suffix=".png", prefix="remove-hash-trim-")
+        os.close(fd)
+        self._tmp.append(png)
+        self._seq[key] += 1
+        seq = self._seq[key]
+        size = f"{self.PREVIEW_W}:{self.PREVIEW_W * 9 // 16}"
+
+        def work():
+            subprocess.run([ffmpeg, "-v", "error", "-y", "-ss", f"{t:.3f}", "-i", self.path, "-frames:v", "1",
+                            "-vf", f"scale={size}:force_original_aspect_ratio=decrease", png],
+                           capture_output=True, timeout=30)
+            self._ready.put((key, seq, png))  # Tk só é tocado na thread principal (_poll)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll(self):
+        if not self.win.winfo_exists():
+            return
+        try:
+            while True:
+                key, seq, png = self._ready.get_nowait()
+                if seq == self._seq[key]:
+                    self._show_preview(key, png)
+        except queue.Empty:
+            pass
+        self._after["poll"] = self.win.after(60, self._poll)
+
+    def _show_preview(self, key: str, png: str):
+        preview = self.widgets[key][0]
+        try:
+            photo = tk.PhotoImage(file=png)
+        except tk.TclError:
+            preview.configure(image=self._blank, text="sem prévia")
+            return
+        self._photos[key] = photo  # mantém a referência viva
+        preview.configure(image=photo, text="")
+
+    def _apply(self):
+        for key in ("start", "end"):
+            self._on_entry(key)
+        start, end = self.start.get(), self.end.get()
+        if end - start < 0.1:
+            messagebox.showwarning("Cortar vídeo", "O fim precisa ser depois do início.", parent=self.win)
+            return
+        start = 0.0 if start < 0.05 else round(start, 3)
+        end = 0.0 if end > self.duration - 0.05 else round(end, 3)  # 0 = até o final
+        self.app.set_trim(self.path, (start, end) if (start or end) else None)
+        self._close()
+
+    def _clear(self):
+        self.app.set_trim(self.path, None)
+        self._close()
+
+    def _close(self):
+        for a in self._after.values():
+            self.win.after_cancel(a)
+        self.win.grab_release()
+        self.win.destroy()
+        for f in self._tmp:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
 # ─────────────────────────────────────────────────────────
 # APLICAÇÃO
 # ─────────────────────────────────────────────────────────
@@ -91,6 +280,12 @@ class App:
         self.keep_icc = tk.BooleanVar(value=True)
         self.reencode = tk.BooleanVar(value=True)
         self.open_after = tk.BooleanVar(value=True)
+        self.watermark_text = tk.StringVar(value="")
+        self.watermark_opacity = tk.DoubleVar(value=0.5)
+        self.watermark_position = tk.StringVar(value="Centro")
+        self.watermark_size = tk.IntVar(value=36)
+        self.remove_audio = tk.BooleanVar(value=False)
+        self.trims: dict[str, tuple[float, float]] = {}  # caminho → (início, fim) em s; fim 0 = até o final
 
         self._setup_fonts()
         self._setup_style()
@@ -255,6 +450,8 @@ class App:
         self.btn_add_folder.pack(side="left", padx=(8, 0))
         self.btn_clear = ttk.Button(tools, text="Limpar", command=self.clear_list)
         self.btn_clear.pack(side="left", padx=(8, 0))
+        self.btn_trim = ttk.Button(tools, text="✂ Cortar vídeo", command=self.open_trimmer, state="disabled")
+        self.btn_trim.pack(side="left", padx=(8, 0))
         self.lbl_count = ttk.Label(tools, text="Nenhum arquivo", style="Dim.TLabel")
         self.lbl_count.pack(side="right")
 
@@ -286,6 +483,7 @@ class App:
         self.tree.tag_configure("error", foreground=P["red"])
         self.tree.bind("<Double-1>", self._show_details)
         self.tree.bind("<Return>", self._show_details)
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
         self.lbl_empty = tk.Label(
             table, text="Adicione arquivos ou uma pasta para começar\n\n"
@@ -313,6 +511,27 @@ class App:
         self.chk_reenc.pack(side="left", padx=(18, 0))
         self.chk_open = ttk.Checkbutton(opts, text="Abrir pasta ao concluir", variable=self.open_after)
         self.chk_open.pack(side="left", padx=(18, 0))
+        self.chk_audio = ttk.Checkbutton(opts, text="Remover áudio (vídeos)", variable=self.remove_audio)
+        self.chk_audio.pack(side="left", padx=(18, 0))
+
+        # Marca d'água
+        wm_frame = ttk.Frame(outer)
+        wm_frame.pack(fill="x", pady=(8, 0))
+        ttk.Label(wm_frame, text="Marca d'água (vídeos):", style="Dim.TLabel").pack(side="left")
+        self.entry_wm = ttk.Entry(wm_frame, textvariable=self.watermark_text, width=15)
+        self.entry_wm.pack(side="left", padx=(8, 8))
+        
+        ttk.Label(wm_frame, text="Tamanho:", style="Dim.TLabel").pack(side="left")
+        self.spin_wm_size = ttk.Spinbox(wm_frame, from_=10, to=200, increment=2, textvariable=self.watermark_size, width=4)
+        self.spin_wm_size.pack(side="left", padx=(4, 8))
+        
+        ttk.Label(wm_frame, text="Transp.:", style="Dim.TLabel").pack(side="left")
+        self.scale_wm_opacity = ttk.Scale(wm_frame, from_=0.1, to=1.0, variable=self.watermark_opacity, orient="horizontal", length=80)
+        self.scale_wm_opacity.pack(side="left", padx=(4, 8))
+        
+        ttk.Label(wm_frame, text="Posição:", style="Dim.TLabel").pack(side="left")
+        self.combo_wm_pos = ttk.Combobox(wm_frame, textvariable=self.watermark_position, values=["Centro", "Repetir"], state="readonly", width=8)
+        self.combo_wm_pos.pack(side="left", padx=(4, 0))
 
         # Progresso
         prog = ttk.Frame(outer)
@@ -426,10 +645,12 @@ class App:
         self.files.clear()
         self.rows.clear()
         self.results.clear()
+        self.trims.clear()
         self.progress_var.set(0)
         self.set_status("Pronto")
         self.lbl_time.configure(text="")
         self._update_count()
+        self._on_tree_select()
 
     def _remove_selected(self, event=None):
         if self.is_processing or not self.tree.selection():
@@ -443,8 +664,10 @@ class App:
                 self.files.remove(path)
                 del self.rows[path]
                 self.results.pop(path, None)
+                self.trims.pop(path, None)
             self.tree.delete(iid)
         self._update_count()
+        self._on_tree_select()
 
     def _update_count(self):
         n = len(self.files)
@@ -493,10 +716,51 @@ class App:
     def _set_controls(self, processing: bool):
         state = "disabled" if processing else "normal"
         for w in (self.btn_add_files, self.btn_add_folder, self.btn_clear, self.btn_out,
-                  self.chk_icc, self.chk_reenc, self.btn_process):
+                  self.chk_icc, self.chk_reenc, self.btn_process, self.entry_wm,
+                  self.spin_wm_size, self.scale_wm_opacity, self.chk_audio):
             w.configure(state=state)
+        self.combo_wm_pos.configure(state="disabled" if processing else "readonly")
         self.entry_out.configure(state="disabled" if processing else "normal")
         self.btn_cancel.configure(state="normal" if processing else "disabled")
+        self._on_tree_select()
+
+    def _selected_path(self) -> str | None:
+        sel = self.tree.selection()
+        if len(sel) != 1:
+            return None
+        return next((p for p, i in self.rows.items() if i == sel[0]), None)
+
+    def _on_tree_select(self, event=None):
+        path = self._selected_path()
+        ok = (not self.is_processing and getattr(self, "ffmpeg_ok", False) and path is not None
+              and core.get_file_type(path) == "video")
+        self.btn_trim.configure(state="normal" if ok else "disabled")
+
+    def _pending_label(self, path: str) -> str:
+        trim = self.trims.get(path)
+        if not trim:
+            return "Aguardando"
+        return f"Aguardando · ✂ {fmt_time(trim[0])}–{fmt_time(trim[1]) if trim[1] else 'fim'}"
+
+    # ── corte rápido ──
+
+    def open_trimmer(self):
+        path = self._selected_path()
+        if self.is_processing or not path or core.get_file_type(path) != "video":
+            return
+        duration = core.media_duration(path)
+        if duration <= 0:
+            messagebox.showerror("Cortar vídeo", "Não foi possível ler a duração deste vídeo.")
+            return
+        TrimDialog(self, path, duration)
+
+    def set_trim(self, path: str, trim: tuple[float, float] | None):
+        if trim:
+            self.trims[path] = trim
+        else:
+            self.trims.pop(path, None)
+        if path in self.rows and not self.is_processing:
+            self._set_row(path, self._pending_label(path), "pending")
 
     # ── processamento ──
 
@@ -516,6 +780,13 @@ class App:
             except OSError as e:
                 messagebox.showerror("Destino", f"Não foi possível usar a pasta de destino:\n{e}")
                 return
+        try:
+            wm_size = int(self.watermark_size.get())
+        except (tk.TclError, ValueError):
+            wm_size = 0
+        if not 10 <= wm_size <= 200:
+            messagebox.showwarning("Marca d'água", "O tamanho da marca d'água deve ser um número entre 10 e 200.")
+            return
         needs_ffmpeg = any(core.get_file_type(f) != "image" for f in self.files)
         if needs_ffmpeg and not core.check_ffmpeg():
             self._refresh_ffmpeg_status()
@@ -535,10 +806,19 @@ class App:
         self.btn_report.configure(state="disabled")
         self._set_controls(True)
         for f in self.files:
-            self._set_row(f, "Aguardando", "pending", "")
+            self._set_row(f, self._pending_label(f), "pending", "")
         self.set_status("Iniciando…")
 
-        options = core.Options(keep_icc=self.keep_icc.get(), reencode_fallback=self.reencode.get())
+        options = core.Options(
+            keep_icc=self.keep_icc.get(),
+            reencode_fallback=self.reencode.get(),
+            watermark_text=self.watermark_text.get().strip(),
+            watermark_opacity=self.watermark_opacity.get(),
+            watermark_position="repeat" if self.watermark_position.get() == "Repetir" else "center",
+            watermark_size=wm_size,
+            remove_audio=self.remove_audio.get(),
+            trims=dict(self.trims),
+        )
         files = list(self.files)
         threading.Thread(target=self._worker, args=(files, out, options), daemon=True).start()
         self._tick_time()

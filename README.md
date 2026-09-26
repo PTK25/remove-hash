@@ -48,6 +48,14 @@ curl -fsSL https://raw.githubusercontent.com/PTK25/remove-hash/main/uninstall.sh
 
 Abra **Removedor de Metadados** (Launchpad ou Spotlight), adicione arquivos ou uma pasta inteira (subpastas incluídas), escolha o destino e clique em **Processar**. Cada linha mostra o status e o novo hash; dê **duplo clique** em um arquivo para ver os detalhes (metadados removidos, hashes completos, tags técnicas restantes).
 
+Edição rápida de vídeos (só no app):
+
+- **Marca d'água** — texto no centro ou repetido em grade 3×3, com tamanho (relativo a um vídeo 1080p, escala com a resolução) e transparência ajustáveis.
+- **Remover áudio** — descarta as faixas de áudio sem recodificar o vídeo.
+- **✂ Cortar vídeo** — selecione um vídeo e escolha início e fim, com prévia do quadro.
+
+Marca d'água e corte recodificam o vídeo (H.264/VP9) e descartam legendas.
+
 `Arquivo → Inspecionar metadados…` mostra o que um arquivo contém **sem modificá-lo** — útil para conferir o antes e o depois.
 
 ### Terminal

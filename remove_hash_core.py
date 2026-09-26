@@ -100,6 +100,12 @@ class Options:
     keep_icc: bool = True            # manter perfil de cor (não identifica ninguém; evita cores erradas)
     reencode_fallback: bool = True   # recodificar vídeo/áudio se a cópia direta falhar
     jpeg_quality: int = 92           # qualidade ao converter HEIC/RAW → JPEG
+    watermark_text: str = ""         # texto da marca d'água (só vídeos); vazio = sem marca
+    watermark_opacity: float = 0.5   # 0.05–1.0
+    watermark_position: str = "center"  # "center" ou "repeat" (grade 3×3)
+    watermark_size: int = 36         # altura da fonte em px num vídeo 1080p; escala com a resolução
+    remove_audio: bool = False       # vídeos: descartar as faixas de áudio
+    trims: dict[str, tuple[float, float]] = field(default_factory=dict)  # caminho → (início, fim) em s; fim 0 = até o final
 
 
 @dataclass
@@ -1239,16 +1245,122 @@ def describe_media_metadata(path: str) -> list[str]:
     return found
 
 
+# Desenhada com AppKit via JXA (osascript), que vem em todo macOS: o ffmpeg do Homebrew
+# não traz o filtro drawtext e o projeto não usa dependências pip em tempo de execução.
+_WATERMARK_JXA = r"""
+ObjC.import('Cocoa');
+function run(argv) {
+  const text = argv[0], size = parseFloat(argv[1]), alpha = parseFloat(argv[2]), out = argv[3];
+  const attrs = $.NSMutableDictionary.alloc.init;
+  attrs.setObjectForKey($.NSFont.boldSystemFontOfSize(size), $.NSFontAttributeName);
+  attrs.setObjectForKey($.NSColor.colorWithSRGBRedGreenBlueAlpha(1, 1, 1, alpha), $.NSForegroundColorAttributeName);
+  attrs.setObjectForKey($.NSColor.colorWithSRGBRedGreenBlueAlpha(0, 0, 0, alpha * 0.7), $.NSStrokeColorAttributeName);
+  attrs.setObjectForKey($(-2.5), $.NSStrokeWidthAttributeName);
+  const s = $(text);
+  const sz = s.sizeWithAttributes(attrs), pad = Math.ceil(size * 0.2);
+  const w = Math.ceil(sz.width) + 2 * pad, h = Math.ceil(sz.height) + 2 * pad;
+  const rep = $.NSBitmapImageRep.alloc.initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(
+    null, w, h, 8, 4, true, false, $.NSDeviceRGBColorSpace, 0, 0);
+  $.NSGraphicsContext.saveGraphicsState;
+  $.NSGraphicsContext.setCurrentContext($.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep));
+  s.drawAtPointWithAttributes($.NSMakePoint(pad, pad), attrs);
+  $.NSGraphicsContext.restoreGraphicsState;
+  const data = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+  if (!data.writeToFileAtomically($(out), true)) throw new Error('falha ao gravar PNG');
+}
+"""
+
+
+def make_watermark_png(text: str, font_px: float, opacity: float, out_path: str) -> None:
+    """Gera um PNG transparente com o texto (branco, contorno escuro) em pixels reais, sem escala Retina."""
+    if sys.platform != "darwin":
+        raise RuntimeError("marca d'água disponível apenas no macOS")
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+        f.write(_WATERMARK_JXA)
+        script = f.name
+    try:
+        out = subprocess.run(["osascript", "-l", "JavaScript", script, text, f"{font_px:.1f}",
+                              f"{max(0.05, min(1.0, opacity)):.3f}", out_path],
+                             capture_output=True, text=True, timeout=60)
+    finally:
+        os.remove(script)
+    if out.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError("falha ao gerar a marca d'água: " + out.stderr.strip()[-200:])
+
+
+def video_dimensions(path: str) -> tuple[int, int]:
+    """Largura e altura do primeiro stream de vídeo (ignora capas embutidas)."""
+    info = ffprobe_json(path) or {}
+    for st in info.get("streams", []):
+        if st.get("codec_type") == "video" and not st.get("disposition", {}).get("attached_pic"):
+            return int(st.get("width") or 0), int(st.get("height") or 0)
+    return 0, 0
+
+
+def normalize_trim(trim: Optional[tuple[float, float]], duration: float) -> Optional[tuple[float, float]]:
+    """(início, fim) em segundos; fim 0 = até o final. Devolve None se o corte não muda nada."""
+    if not trim:
+        return None
+    start, end = max(0.0, float(trim[0] or 0)), max(0.0, float(trim[1] or 0))
+    if duration > 0:
+        if start >= duration:
+            raise ValueError(f"início do corte ({start:.1f} s) passa da duração do arquivo ({duration:.1f} s)")
+        if end >= duration:
+            end = 0.0
+    if end and end <= start:
+        raise ValueError("o fim do corte precisa ser maior que o início")
+    if start == 0 and end == 0:
+        return None
+    return start, end
+
+
+# Posições (x:y) da marca d'água; W/H = vídeo, w/h = marca
+_WM_CENTER = ["(W-w)/2:(H-h)/2"]
+_WM_GRID = [f"{x}:{y}"
+            for y in ("H*0.08", "(H-h)/2", "H*0.92-h")
+            for x in ("W*0.06", "(W-w)/2", "W*0.94-w")]
+
+
+def _watermark_filter(position: str) -> str:
+    spots = _WM_GRID if position == "repeat" else _WM_CENTER
+    n = len(spots)
+    # Um rótulo de filtro só pode ser consumido uma vez: duplica a marca com split.
+    fc = f"[1:v]split={n}" + "".join(f"[wm{i}]" for i in range(n)) + ";" if n > 1 else "[1:v]null[wm0];"
+    prev = "[0:V]"
+    for i, xy in enumerate(spots):
+        nxt = "[vout]" if i == n - 1 else f"[v{i}]"
+        fc += f"{prev}[wm{i}]overlay={xy}:format=auto{nxt}"
+        fc += "" if i == n - 1 else ";"
+        prev = nxt
+    return fc
+
+
 # ─────────────────────────────────────────────────────────
 # Vídeo / áudio via ffmpeg
 # ─────────────────────────────────────────────────────────
 
-def _ffmpeg_cmd(ffmpeg: str, inp: str, out: str, kind: str, ext: str, mode: str, subs: bool) -> list[str]:
-    cmd = [ffmpeg, "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", inp,
-           "-map_metadata", "-1", "-map_chapters", "-1",
-           "-fflags", "+bitexact", "-flags", "+bitexact", "-dn"]
+def _ffmpeg_cmd(ffmpeg: str, inp: str, out: str, kind: str, ext: str, mode: str, subs: bool,
+                options: Options, trim: Optional[tuple[float, float]] = None,
+                wm_png: Optional[str] = None) -> list[str]:
+    cmd = [ffmpeg, "-y", "-nostdin", "-hide_banner", "-loglevel", "error"]
+    if trim:
+        # -ss/-to antes do -i: busca rápida; na recodificação o corte fica exato no quadro.
+        if trim[0] > 0:
+            cmd += ["-ss", f"{trim[0]:.3f}"]
+        if trim[1] > 0:
+            cmd += ["-to", f"{trim[1]:.3f}"]
+    cmd += ["-i", inp]
+    overlay = bool(wm_png) and kind == "video" and mode != "copy"
+    if overlay:
+        cmd += ["-i", wm_png]
+    cmd += ["-map_metadata", "-1", "-map_chapters", "-1",
+            "-fflags", "+bitexact", "-flags", "+bitexact", "-dn"]
     if kind == "video":
-        cmd += ["-map", "0:V", "-map", "0:a?"]
+        if overlay:
+            cmd += ["-filter_complex", _watermark_filter(options.watermark_position), "-map", "[vout]"]
+        else:
+            cmd += ["-map", "0:V"]
+        cmd += ["-an"] if options.remove_audio else ["-map", "0:a?"]
         cmd += ["-map", "0:s?"] if subs else ["-sn"]
     else:
         cmd += ["-map", "0:a", "-vn", "-sn"]
@@ -1322,31 +1434,63 @@ def process_media(input_path: str, output_path: str, options: Options, result: F
     output_path = _uniquify(output_path)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     duration = media_duration(input_path)
+    trim = normalize_trim(options.trims.get(input_path), duration)
+    if trim:
+        duration = (trim[1] or duration) - trim[0]
+    watermark = kind == "video" and bool(options.watermark_text.strip())
 
     before = describe_media_metadata(input_path)
     result.removed.extend(before)
 
-    attempts = [("copy", True), ("copy", False)]
-    if options.reencode_fallback:
-        attempts.append(("reencode", False))
-    errors = []
-    for mode, subs in attempts:
-        if kind != "video" and not subs:
-            continue  # áudio: só uma tentativa de cópia
-        cmd = _ffmpeg_cmd(ffmpeg, input_path, output_path, kind, ext, mode, subs)
-        rc, err = _run_ffmpeg(cmd, duration, progress_cb, cancel)
-        if rc == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            result.method = "remux" if mode == "copy" else "reencode"
-            if mode == "copy" and not subs and kind == "video":
-                result.notes.append("legendas descartadas (incompatíveis com a cópia direta)")
-            if mode == "reencode":
-                result.notes.append("recodificado (cópia direta dos streams não foi possível)")
-            break
-        errors.append(f"{mode}{'' if subs else ' sem legendas'}: {err.strip()[-300:]}")
-        if os.path.exists(output_path):
-            os.remove(output_path)
+    if watermark or (trim and kind == "video"):
+        # Marca d'água exige recodificar; no corte, a cópia direta só corta em keyframes.
+        attempts = [("reencode", False)]
     else:
-        raise RuntimeError("FFmpeg falhou — " + " || ".join(errors))
+        attempts = [("copy", True), ("copy", False)]
+        if options.reencode_fallback:
+            attempts.append(("reencode", False))
+
+    wm_png = None
+    errors = []
+    try:
+        if watermark:
+            w, h = video_dimensions(input_path)
+            ref = min(w, h) if w and h else 1080  # lado menor: vale para vídeo em pé ou deitado
+            font_px = max(8.0, options.watermark_size * ref / 1080)
+            fd, wm_png = tempfile.mkstemp(suffix=".png", prefix="remove-hash-wm-")
+            os.close(fd)
+            make_watermark_png(options.watermark_text.strip(), font_px, options.watermark_opacity, wm_png)
+        for mode, subs in attempts:
+            if kind != "video" and not subs:
+                continue  # áudio: só uma tentativa de cópia
+            cmd = _ffmpeg_cmd(ffmpeg, input_path, output_path, kind, ext, mode, subs, options, trim, wm_png)
+            rc, err = _run_ffmpeg(cmd, duration, progress_cb, cancel)
+            if rc == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                result.method = "remux" if mode == "copy" else "reencode"
+                if mode == "copy" and not subs and kind == "video":
+                    result.notes.append("legendas descartadas (incompatíveis com a cópia direta)")
+                if mode == "reencode":
+                    if len(attempts) == 1:
+                        result.notes.append("recodificado (necessário para marca d'água/corte; legendas descartadas)")
+                    else:
+                        result.notes.append("recodificado (cópia direta dos streams não foi possível)")
+                break
+            errors.append(f"{mode}{'' if subs else ' sem legendas'}: {err.strip()[-300:]}")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        else:
+            raise RuntimeError("FFmpeg falhou — " + " || ".join(errors))
+    finally:
+        if wm_png and os.path.exists(wm_png):
+            os.remove(wm_png)
+
+    if watermark:
+        result.notes.append(f"marca d'água aplicada: “{options.watermark_text.strip()}”")
+    if trim:
+        end = f"{trim[1]:.1f} s" if trim[1] else "o final"
+        result.notes.append(f"cortado de {trim[0]:.1f} s até {end}")
+    if kind == "video" and options.remove_audio:
+        result.notes.append("áudio removido")
 
     pad = apply_padding(output_path)
     if pad:
